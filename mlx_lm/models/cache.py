@@ -1,9 +1,11 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import hashlib
+import struct
 from collections import deque
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -396,6 +398,302 @@ class KVCache(_BaseCache):
     @classmethod
     def merge(_, caches):
         return BatchKVCache.merge(caches)
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
+
+
+@dataclass
+class BlockHash:
+    """Content-hash identifier for a single KV block.
+
+    Uses the same rolling-hash chain design as vLLM's KVBlockHashProvider:
+    each block's hash is derived from its token IDs and its predecessor's hash,
+    producing a chain that is unique to the exact prefix sequence.
+    """
+
+    value: int
+
+    def __repr__(self):
+        return f"BlockHash(0x{self.value:016x})"
+
+
+def _hash_block(token_ids: List[int], parent_hash: int) -> int:
+    """Compute a 64-bit hash for a single block.
+
+    Combines the parent_hash (hash of the preceding block) with the raw
+    token_ids for this block using SHA-256, then truncates to 64 bits.
+    This produces a Merkle-chain over the token sequence so that any two
+    sequences with the same prefix share the same block hashes up to the
+    length of that prefix.
+
+    Args:
+        token_ids: Token IDs that fill this block (length == block_size).
+        parent_hash: Hash of the immediately preceding block, or 0 for
+            the first block.
+
+    Returns:
+        An unsigned 64-bit integer hash.
+    """
+    # Pack parent hash + token ids into bytes then SHA-256
+    data = struct.pack("Q", parent_hash & 0xFFFFFFFFFFFFFFFF)
+    data += struct.pack(f"{len(token_ids)}i", *token_ids)
+    digest = hashlib.sha256(data).digest()
+    # Take first 8 bytes as little-endian uint64
+    return struct.unpack_from("<Q", digest)[0]
+
+
+class BlockedKVCache(_BaseCache):
+    """Block-level KV cache with content-addressed block hashing.
+
+    A sibling class to :class:`KVCache` that partitions the key/value tensors
+    into fixed-size blocks and computes a :class:`BlockHash` per completed
+    block.  The block hashes form a Merkle chain over the token sequence,
+    matching the design of the ``KVBlockHashProvider`` interface in the
+    substrate's vLLM provider (RFC-0006).
+
+    This enables prefix reuse: two requests that share a common token prefix
+    will produce identical block hashes for the shared region, making it
+    straightforward for a server-side scheduler to detect and share (or
+    skip re-computing) those blocks.
+
+    .. rubric:: Usage example
+
+        >>> cache = BlockedKVCache(block_size=16)
+        >>> k = mx.random.uniform(shape=(1, 8, 32, 64))  # 32 tokens, 8 heads, 64 dim
+        >>> v = mx.random.uniform(shape=(1, 8, 32, 64))
+        >>> cache.update_and_fetch(k, v)  # fills 2 complete blocks
+        >>> len(cache.block_hashes)
+        2
+        >>> cache.block_hashes[0]
+        BlockHash(0x...)
+
+    .. rubric:: Block-hash chain
+
+    For a sequence of tokens ``[t0, t1, ..., tN]`` partitioned into blocks of
+    size ``B``:
+
+    - ``block_hash[0] = hash(tokens[0:B], parent=0)``
+    - ``block_hash[k] = hash(tokens[k*B:(k+1)*B], parent=block_hash[k-1].value)``
+
+    This is identical to the chain used by vLLM's prefix-cache scheduler.
+
+    Args:
+        block_size: Number of tokens per block.  Defaults to 16, matching
+            vLLM's default.  Must be a positive integer.
+        on_block_full: Optional callback ``(layer_block_idx, block_hash)``
+            invoked when a block is filled.  Useful for server-side
+            eviction hooks.
+    """
+
+    step = 256
+
+    def __init__(
+        self,
+        block_size: int = 16,
+        on_block_full=None,
+    ):
+        self.block_size = block_size
+        self.on_block_full = on_block_full
+
+        self.keys = None
+        self.values = None
+        self.offset = 0
+
+        # Token IDs of all tokens appended so far; needed to compute block
+        # hashes.  Filled by update_and_fetch when token_ids is supplied or
+        # left as None-filled entries when not (hash is still computable from
+        # position if token_ids are absent, but the chain is zero-seeded).
+        self._token_ids: List[Optional[int]] = []
+
+        # Completed block hashes in order.
+        self._block_hashes: List[BlockHash] = []
+
+        # Number of tokens in the *current* (incomplete) block.
+        self._block_offset: int = 0
+
+    # ------------------------------------------------------------------
+    # Core update path
+    # ------------------------------------------------------------------
+
+    def update_and_fetch(
+        self,
+        keys,
+        values,
+        token_ids: Optional[List[int]] = None,
+    ):
+        """Append new K/V slices and return the full accumulated slice.
+
+        Mirrors the signature of :meth:`KVCache.update_and_fetch` with an
+        optional ``token_ids`` argument used for block-hash computation.
+
+        Args:
+            keys: Shape ``(B, n_kv_heads, S, k_head_dim)``.
+            values: Shape ``(B, n_kv_heads, S, v_head_dim)``.
+            token_ids: Optional list of S integer token IDs corresponding to
+                the S new tokens.  When omitted the block hashes use ``0``
+                as placeholder IDs (the hash chain is still valid as a
+                structural prefix-match key, just not semantically tied to
+                the exact token values).
+
+        Returns:
+            Tuple ``(keys, values)`` sliced to ``[:, :, :offset, :]``.
+        """
+        prev = self.offset
+        num_new = keys.shape[2]
+
+        # ---- grow the pre-allocated buffer if needed -----------------
+        if self.keys is None or (prev + num_new) > self.keys.shape[2]:
+            B, n_kv_heads, _, k_head_dim = keys.shape
+            v_head_dim = values.shape[3]
+            n_steps = (self.step + num_new - 1) // self.step
+            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
+            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
+            new_k = mx.zeros(k_shape, keys.dtype)
+            new_v = mx.zeros(v_shape, values.dtype)
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = self.keys[..., :prev, :]
+                    self.values = self.values[..., :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                self.values = mx.concatenate([self.values, new_v], axis=2)
+            else:
+                self.keys, self.values = new_k, new_v
+
+        # ---- write the new tokens ------------------------------------
+        self.keys[..., prev : prev + num_new, :] = keys
+        self.values[..., prev : prev + num_new, :] = values
+        self.offset += num_new
+
+        # ---- record token IDs and advance block hash chain -----------
+        if token_ids is None:
+            token_ids = [0] * num_new
+        self._token_ids.extend(token_ids)
+        self._advance_block_hashes()
+
+        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+
+    def _advance_block_hashes(self):
+        """Compute block hashes for any newly completed blocks."""
+        while len(self._token_ids) >= (len(self._block_hashes) + 1) * self.block_size:
+            block_idx = len(self._block_hashes)
+            start = block_idx * self.block_size
+            end = start + self.block_size
+            parent_hash = self._block_hashes[-1].value if self._block_hashes else 0
+            h = BlockHash(_hash_block(self._token_ids[start:end], parent_hash))
+            self._block_hashes.append(h)
+            if self.on_block_full is not None:
+                self.on_block_full(block_idx, h)
+        # Track position within the current incomplete block
+        self._block_offset = len(self._token_ids) - len(self._block_hashes) * self.block_size
+
+    # ------------------------------------------------------------------
+    # Block-hash interface (substrate-facing)
+    # ------------------------------------------------------------------
+
+    @property
+    def block_hashes(self) -> List[BlockHash]:
+        """Hashes for all *completed* blocks in sequence order."""
+        return list(self._block_hashes)
+
+    @property
+    def num_complete_blocks(self) -> int:
+        """Number of fully filled blocks."""
+        return len(self._block_hashes)
+
+    def fork(self) -> "BlockedKVCache":
+        """Return a shallow copy suitable for fork-over-kvcache.
+
+        The forked cache shares the same block hash chain as its parent up to
+        the current offset.  New tokens appended to the fork do not affect the
+        parent's hashes or tensor storage.
+
+        Returns:
+            A new :class:`BlockedKVCache` whose key/value tensors are a
+            copy of the parent's current content.
+        """
+        child = BlockedKVCache(
+            block_size=self.block_size,
+            on_block_full=self.on_block_full,
+        )
+        if self.keys is not None:
+            child.keys = mx.contiguous(self.keys[..., : self.offset, :])
+            child.values = mx.contiguous(self.values[..., : self.offset, :])
+        child.offset = self.offset
+        child._token_ids = list(self._token_ids)
+        child._block_hashes = list(self._block_hashes)
+        child._block_offset = self._block_offset
+        return child
+
+    # ------------------------------------------------------------------
+    # _BaseCache protocol
+    # ------------------------------------------------------------------
+
+    def size(self):
+        return self.offset
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None
+        if self.offset == self.keys.shape[2]:
+            return self.keys, self.values
+        return (
+            self.keys[..., : self.offset, :],
+            self.values[..., : self.offset, :],
+        )
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values = v
+        if self.keys is not None:
+            self.offset = self.keys.shape[2]
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(
+                str,
+                (
+                    self.block_size,
+                    self.offset,
+                    self._block_offset,
+                    len(self._block_hashes),
+                ),
+            )
+        )
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.block_size, self.offset, self._block_offset, n_blocks = map(int, v)
+        # Block hash chain cannot be reconstructed without token IDs;
+        # leave _block_hashes empty and _token_ids as placeholder zeros
+        # so the cache is structurally valid but hashes are zero-seeded.
+        self._token_ids = [0] * self.offset
+        self._block_hashes = []
+        self._advance_block_hashes()
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        # Truncate token IDs and recompute block hashes from scratch
+        self._token_ids = self._token_ids[: self.offset]
+        self._block_hashes = []
+        self._block_offset = 0
+        self._advance_block_hashes()
+        return n
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
 
     def empty(self):
         return self.keys is None
