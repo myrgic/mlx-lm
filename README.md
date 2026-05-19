@@ -1,3 +1,13 @@
+## Myrgic fork note
+
+This is a fork of [ml-explore/mlx-lm](https://github.com/ml-explore/mlx-lm). The one local addition is `BlockedKVCache` in `mlx_lm/models/cache.py`: a block-level KV cache that computes a content-addressed hash chain (Merkle structure, one hash per block) over the key/value tensors as generation proceeds.
+
+The purpose is inference-side experiments for the [cogos](https://github.com/myrgic/cogos) substrate: specifically, prefix-hit detection and block-level cache sharing between concurrent agent sessions. The hash chain format aligns with the block hash design used by vLLM's `KVBlockHashProvider`.
+
+This fork is exploratory. It may or may not roll into upstream mlx-lm. The `BlockedKVCache` class is a peer of upstream `KVCache` and does not modify existing behavior.
+
+---
+
 ## MLX LM 
 
 MLX LM is a Python package for generating text and fine-tuning large language
